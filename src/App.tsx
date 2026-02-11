@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FutureScene } from "./components/FutureScene";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { type OutboundAttachment, useOpenClawChat } from "./hooks/useOpenClawChat";
 import "./App.css";
 
@@ -22,12 +23,14 @@ type PreviewImageState = {
 };
 
 const ROOMS_STORAGE_KEY = "openclaw.rooms.v1";
+const LEGACY_ROOMS_STORAGE_KEYS = ["openclaw.rooms", "openclaw.rooms.v0", "openclaw.room-configs.v1"];
 const MAIN_ROOM_ID = "main-room";
 const MAIN_ROOM: RoomConfig = {
   id: MAIN_ROOM_ID,
   name: "main",
   agentId: "main",
 };
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
 function createRoomId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -56,6 +59,17 @@ function joinBasePath(baseUrl: string, subPath: string): string {
   const normalizedBase = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
   const normalizedSub = subPath.startsWith("/") ? subPath.slice(1) : subPath;
   return `${normalizedBase}${normalizedSub}`;
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  return LOOPBACK_HOSTS.has(normalized);
+}
+
+function buildGatewayProxyUrl(basePath: string): string {
+  const proxyUrl = new URL(joinBasePath(basePath, "api/gateway/ws"), window.location.href);
+  proxyUrl.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return proxyUrl.toString();
 }
 
 async function fileToDataUrl(file: File): Promise<string> {
@@ -87,6 +101,21 @@ function formatFileSize(bytes: number): string {
   return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
 }
 
+const CHAT_TIME_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
+
+function formatMessageTime(createdAt: string): string {
+  const date = new Date(createdAt);
+  if (Number.isNaN(date.getTime())) {
+    return "--:--";
+  }
+  return CHAT_TIME_FORMATTER.format(date);
+}
+
 function ensureMainRoom(rooms: RoomConfig[]): RoomConfig[] {
   const cleaned = rooms
     .filter((room) => room && typeof room.id === "string" && room.id.trim())
@@ -112,32 +141,79 @@ function ensureMainRoom(rooms: RoomConfig[]): RoomConfig[] {
   );
 }
 
+function parseRoomsCandidate(parsed: unknown): RoomConfig[] {
+  const arraySource = Array.isArray(parsed)
+    ? parsed
+    : isRecord(parsed) && Array.isArray(parsed.rooms)
+      ? parsed.rooms
+      : [];
+  if (arraySource.length === 0) {
+    return [];
+  }
+  const rooms: RoomConfig[] = [];
+  for (let index = 0; index < arraySource.length; index += 1) {
+    const item = arraySource[index];
+    if (!isRecord(item)) {
+      continue;
+    }
+    const fallbackName = typeof item.name === "string" ? item.name.trim() : "";
+    const rawId = typeof item.id === "string" ? item.id.trim() : "";
+    const id = rawId || (fallbackName ? `legacy-${index}-${fallbackName}` : "");
+    const name = typeof item.name === "string" ? item.name : "";
+    const agentId = typeof item.agentId === "string" ? item.agentId : "main";
+    if (!id.trim()) {
+      continue;
+    }
+    rooms.push({ id, name, agentId });
+  }
+  return rooms;
+}
+
 function loadRoomsFromStorage(): RoomConfig[] {
   try {
-    const raw = localStorage.getItem(ROOMS_STORAGE_KEY);
-    if (!raw) {
-      return [MAIN_ROOM];
-    }
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      return [MAIN_ROOM];
-    }
-
-    const rooms: RoomConfig[] = [];
-    for (const item of parsed) {
-      if (!isRecord(item)) {
+    const keys = [ROOMS_STORAGE_KEY, ...LEGACY_ROOMS_STORAGE_KEYS];
+    for (const key of keys) {
+      const raw = localStorage.getItem(key);
+      if (!raw) {
         continue;
       }
-      const id = typeof item.id === "string" ? item.id : "";
-      const name = typeof item.name === "string" ? item.name : "";
-      const agentId = typeof item.agentId === "string" ? item.agentId : "main";
-      if (!id.trim()) {
-        continue;
+      const parsed = JSON.parse(raw);
+      const rooms = parseRoomsCandidate(parsed);
+
+      if (rooms.length > 0) {
+        return ensureMainRoom(rooms);
       }
-      rooms.push({ id, name, agentId });
     }
 
-    return ensureMainRoom(rooms);
+    // Best-effort migration for unknown legacy keys from older builds.
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (!key) {
+        continue;
+      }
+      if (keys.includes(key)) {
+        continue;
+      }
+      if (!/room/i.test(key)) {
+        continue;
+      }
+      const raw = localStorage.getItem(key);
+      if (!raw) {
+        continue;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+      const rooms = parseRoomsCandidate(parsed);
+      if (rooms.length > 0) {
+        return ensureMainRoom(rooms);
+      }
+    }
+
+    return [MAIN_ROOM];
   } catch {
     return [MAIN_ROOM];
   }
@@ -151,14 +227,44 @@ function App() {
   const [previewImage, setPreviewImage] = useState<PreviewImageState | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showMobileRooms, setShowMobileRooms] = useState(false);
+  const [topbarExpanded, setTopbarExpanded] = useState(true);
   const [rooms, setRooms] = useState<RoomConfig[]>(() => loadRoomsFromStorage());
   const [activeRoomId, setActiveRoomId] = useState(MAIN_ROOM_ID);
+  const [roomsApiReady, setRoomsApiReady] = useState(false);
 
-  const defaultUrl = useMemo(() => import.meta.env.VITE_OPENCLAW_WS_URL ?? "ws://127.0.0.1:18789", []);
+  const defaultUrl = useMemo(() => {
+    const configured = (import.meta.env.VITE_OPENCLAW_WS_URL ?? "").trim();
+    const basePath = import.meta.env.BASE_URL ?? "/";
+
+    if (typeof window === "undefined") {
+      return configured || "ws://127.0.0.1:18789";
+    }
+
+    if (!configured) {
+      return buildGatewayProxyUrl(basePath);
+    }
+
+    try {
+      const configuredUrl = new URL(configured);
+      if (isLoopbackHost(configuredUrl.hostname) && !isLoopbackHost(window.location.hostname)) {
+        return buildGatewayProxyUrl(basePath);
+      }
+    } catch {
+      return configured;
+    }
+
+    return configured;
+  }, []);
   const defaultToken = useMemo(() => import.meta.env.VITE_OPENCLAW_TOKEN ?? "", []);
   const uploadApiCandidates = useMemo(() => {
     const fromBase = joinBasePath(import.meta.env.BASE_URL ?? "/", "api/uploads");
     const candidates = [fromBase, "/api/uploads"];
+    return Array.from(new Set(candidates));
+  }, []);
+  const roomsApiCandidates = useMemo(() => {
+    const fromBase = joinBasePath(import.meta.env.BASE_URL ?? "/", "api/rooms");
+    const candidates = [fromBase, "/api/rooms"];
     return Array.from(new Set(candidates));
   }, []);
 
@@ -178,11 +284,13 @@ function App() {
     chatMessages,
     connect,
     disconnect,
+    cancelPending,
     sendPrompt,
     switchAgent,
   } = useOpenClawChat(defaultUrl, defaultToken);
 
   const connected = status === "connected";
+  const topbarCollapsed = connected && !topbarExpanded;
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
@@ -235,6 +343,10 @@ function App() {
     () => pendingAttachments.filter((attachment) => typeof attachment.imageDataUrl === "string" && attachment.imageDataUrl.length > 0),
     [pendingAttachments],
   );
+  const nonImageAttachments = useMemo(
+    () => pendingAttachments.filter((attachment) => !(typeof attachment.imageDataUrl === "string" && attachment.imageDataUrl.length > 0)),
+    [pendingAttachments],
+  );
 
   useEffect(() => {
     const node = chatScrollRef.current;
@@ -249,11 +361,99 @@ function App() {
   }, [roomList]);
 
   useEffect(() => {
+    let cancelled = false;
+    const loadRoomsFromApi = async () => {
+      try {
+        for (const endpoint of roomsApiCandidates) {
+          let response: Response;
+          try {
+            response = await fetch(endpoint, { method: "GET" });
+          } catch {
+            continue;
+          }
+          if (!response.ok) {
+            continue;
+          }
+          const payload = (await response.json()) as unknown;
+          if (!isRecord(payload) || !Array.isArray(payload.rooms)) {
+            continue;
+          }
+          const nextRooms: RoomConfig[] = [];
+          for (const item of payload.rooms) {
+            if (!isRecord(item)) {
+              continue;
+            }
+            const id = typeof item.id === "string" ? item.id.trim() : "";
+            if (!id) {
+              continue;
+            }
+            const name = typeof item.name === "string" ? item.name : id;
+            const agentId = typeof item.agentId === "string" ? item.agentId : "main";
+            nextRooms.push({ id, name, agentId });
+          }
+          if (!cancelled) {
+            const normalized = ensureMainRoom(nextRooms);
+            setRooms((current) => {
+              const localNormalized = ensureMainRoom(current);
+              if (normalized.length <= 1 && localNormalized.length > 1) {
+                return localNormalized;
+              }
+              return normalized;
+            });
+          }
+          break;
+        }
+      } finally {
+        if (!cancelled) {
+          setRoomsApiReady(true);
+        }
+      }
+    };
+    void loadRoomsFromApi();
+    return () => {
+      cancelled = true;
+    };
+  }, [roomsApiCandidates]);
+
+  useEffect(() => {
+    if (!roomsApiReady) {
+      return;
+    }
+    const syncRoomsToApi = async () => {
+      for (const endpoint of roomsApiCandidates) {
+        try {
+          const response = await fetch(endpoint, {
+            method: "PUT",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ rooms: roomList }),
+          });
+          if (response.ok) {
+            break;
+          }
+        } catch {
+          // Ignore unavailable endpoint and try next candidate.
+        }
+      }
+    };
+    void syncRoomsToApi();
+  }, [roomList, roomsApiCandidates, roomsApiReady]);
+
+  useEffect(() => {
     if (!connected) {
       return;
     }
     void switchAgent(activeTargetAgentId);
   }, [connected, activeTargetAgentId, switchAgent]);
+
+  useEffect(() => {
+    if (connected) {
+      setTopbarExpanded(false);
+      return;
+    }
+    setTopbarExpanded(true);
+  }, [connected]);
 
   useEffect(() => {
     if (!previewImage) {
@@ -436,8 +636,8 @@ function App() {
     void uploadFiles(files);
   }, [uploadFiles]);
 
-  const removeAttachment = (index: number) => {
-    setPendingAttachments((current) => current.filter((_, currentIndex) => currentIndex !== index));
+  const removeAttachment = (relativePath: string) => {
+    setPendingAttachments((current) => current.filter((attachment) => attachment.relativePath !== relativePath));
   };
 
   const onSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -491,6 +691,7 @@ function App() {
     const room = roomList.find((item) => item.id === roomId) ?? roomList.find((item) => item.id === MAIN_ROOM_ID);
     const nextRoomId = room?.id ?? MAIN_ROOM_ID;
     setActiveRoomId(nextRoomId);
+    setShowMobileRooms(false);
     if (!connected) {
       return;
     }
@@ -506,77 +707,116 @@ function App() {
       <div className="background-noise" />
       <div className="background-rings" />
 
-      <header className="topbar">
+      <header className={`topbar ${topbarCollapsed ? "collapsed" : ""}`}>
         <div className="topbar-title-wrap">
           <h1 className="topbar-title">OpenClaw Visual Gateway</h1>
           <span className={`status-badge status-${status}`}>{STATUS_TEXT[status]}</span>
           <span className="status-session">Session: {sessionKey}</span>
         </div>
 
-        <div className="topbar-controls">
-          <label className="field">
-            <span>Gateway URL</span>
-            <input
-              value={gatewayUrl}
-              onChange={(event) => setGatewayUrl(event.target.value)}
-              placeholder="ws://127.0.0.1:18789"
-            />
-          </label>
-
-          <label className="field">
-            <span>Token</span>
-            <input
-              type="password"
-              value={token}
-              onChange={(event) => setToken(event.target.value)}
-              placeholder="OpenClaw token"
-            />
-          </label>
-
-          <button
-            type="button"
-            className="connect-button"
-            onClick={() => {
-              if (connected) {
+        {topbarCollapsed ? (
+          <div className="topbar-collapsed-actions">
+            <button
+              type="button"
+              className="topbar-expand-button"
+              onClick={() => {
+                setTopbarExpanded(true);
+              }}
+            >
+              展开连接设置
+            </button>
+            <button
+              type="button"
+              className="settings-button"
+              onClick={() => {
+                setShowSettings(true);
+              }}
+            >
+              设置
+            </button>
+            <button
+              type="button"
+              className="connect-button"
+              onClick={() => {
                 disconnect();
-                return;
-              }
-              void connect();
-            }}
-          >
-            {connected ? "断开" : "连接"}
-          </button>
+              }}
+            >
+              断开
+            </button>
+          </div>
+        ) : (
+          <div className="topbar-controls">
+            <label className="field">
+              <span>Gateway URL</span>
+              <input
+                value={gatewayUrl}
+                onChange={(event) => setGatewayUrl(event.target.value)}
+                placeholder="ws://127.0.0.1:18789"
+              />
+            </label>
 
-          <button
-            type="button"
-            className="settings-button"
-            onClick={() => {
-              setShowSettings(true);
-            }}
-          >
-            设置
-          </button>
-        </div>
+            <label className="field">
+              <span>Token</span>
+              <input
+                type="password"
+                value={token}
+                onChange={(event) => setToken(event.target.value)}
+                placeholder="OpenClaw token"
+              />
+            </label>
+
+            <button
+              type="button"
+              className="connect-button"
+              onClick={() => {
+                if (connected) {
+                  disconnect();
+                  return;
+                }
+                void connect();
+              }}
+            >
+              {connected ? "断开" : "连接"}
+            </button>
+
+            <button
+              type="button"
+              className="settings-button"
+              onClick={() => {
+                setShowSettings(true);
+              }}
+            >
+              设置
+            </button>
+          </div>
+        )}
       </header>
 
       <main className="main-grid">
-        <section className="scene-card" aria-label="3D 机器人">
-          <FutureScene connected={connected} streaming={isStreaming} />
-          <div className="scene-caption">Robot Console</div>
-        </section>
-
         <section className="chat-card" aria-label="问答面板">
           <div className="chat-head">
-            <h2>对话屏幕</h2>
-            <span>
-              {agentSwitching
-                ? "切换房间中..."
-                : isStreaming
-                  ? "OpenClaw 正在回复..."
-                  : activeRoom
-                    ? `当前房间: ${activeRoom.name}`
-                    : "等待指令"}
-            </span>
+            <div className="chat-head-main">
+              <h2>对话屏幕</h2>
+              <span>
+                {agentSwitching
+                  ? "切换房间中..."
+                  : isStreaming
+                    ? "OpenClaw 正在回复..."
+                    : activeRoom
+                      ? `当前房间: ${activeRoom.name}`
+                      : "等待指令"}
+              </span>
+            </div>
+            <button
+              type="button"
+              className="mobile-room-toggle"
+              disabled={agentSwitching}
+              onClick={() => {
+                setShowMobileRooms(true);
+              }}
+            >
+              房间: {activeRoom?.name ?? "main"}
+            </button>
           </div>
 
           <div className="chat-body">
@@ -588,7 +828,7 @@ function App() {
                     type="button"
                     key={room.id}
                     className={`agent-item ${effectiveActiveRoomId === room.id ? "active" : ""}`}
-                    disabled={agentSwitching || isStreaming}
+                    disabled={agentSwitching}
                     onClick={async () => {
                       await selectRoom(room.id);
                     }}
@@ -610,7 +850,24 @@ function App() {
                   <div className="chat-role">
                     {message.role === "user" ? "你" : message.role === "assistant" ? "OpenClaw" : "系统"}
                   </div>
-                  {message.text ? <pre className="chat-text">{message.text}</pre> : null}
+                  {message.text ? (
+                    message.role === "assistant" ? (
+                      <div className="chat-markdown">
+                        <ReactMarkdown
+                          remarkPlugins={[remarkGfm]}
+                          components={{
+                            a: ({ ...props }) => (
+                              <a {...props} target="_blank" rel="noreferrer noopener" />
+                            ),
+                          }}
+                        >
+                          {message.text}
+                        </ReactMarkdown>
+                      </div>
+                    ) : (
+                      <pre className="chat-text">{message.text}</pre>
+                    )
+                  ) : null}
                   {message.role === "user" && Array.isArray(message.images) && message.images.length > 0 ? (
                     <div className="chat-images">
                       {message.images.map((image) => (
@@ -631,6 +888,7 @@ function App() {
                       ))}
                     </div>
                   ) : null}
+                  <div className="chat-time">{formatMessageTime(message.createdAt)}</div>
                 </article>
               ))}
             </div>
@@ -670,31 +928,44 @@ function App() {
             {imageAttachments.length > 0 ? (
               <div className="attachment-image-strip">
                 {imageAttachments.map((attachment) => (
-                  <button
-                    key={`thumb-${attachment.relativePath}`}
-                    type="button"
-                    className={`attachment-thumb-button ${previewImage?.src === attachment.imageDataUrl ? "active" : ""}`}
-                    onClick={() => {
-                      if (!attachment.imageDataUrl) {
-                        return;
-                      }
-                      setPreviewImage({
-                        src: attachment.imageDataUrl,
-                        title: attachment.fileName,
-                      });
-                    }}
-                    title={`查看大图: ${attachment.fileName}`}
-                  >
-                    <img src={attachment.imageDataUrl} alt={attachment.fileName} className="attachment-thumb-image" />
-                  </button>
+                  <div key={`thumb-${attachment.relativePath}`} className="attachment-thumb-wrap">
+                    <button
+                      type="button"
+                      className={`attachment-thumb-button ${previewImage?.src === attachment.imageDataUrl ? "active" : ""}`}
+                      onClick={() => {
+                        if (!attachment.imageDataUrl) {
+                          return;
+                        }
+                        setPreviewImage({
+                          src: attachment.imageDataUrl,
+                          title: attachment.fileName,
+                        });
+                      }}
+                      title={`查看大图: ${attachment.fileName}`}
+                    >
+                      <img src={attachment.imageDataUrl} alt={attachment.fileName} className="attachment-thumb-image" />
+                    </button>
+                    <button
+                      type="button"
+                      className="attachment-thumb-remove"
+                      disabled={isStreaming || agentSwitching || uploading}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        removeAttachment(attachment.relativePath);
+                      }}
+                      aria-label={`移除 ${attachment.fileName}`}
+                    >
+                      ×
+                    </button>
+                  </div>
                 ))}
               </div>
             ) : null}
 
-            {pendingAttachments.length > 0 ? (
+            {nonImageAttachments.length > 0 ? (
               <div className="attachment-list">
-                {pendingAttachments.map((attachment, index) => (
-                  <div key={`${attachment.relativePath}-${index}`} className="attachment-item">
+                {nonImageAttachments.map((attachment) => (
+                  <div key={attachment.relativePath} className="attachment-item">
                     <span className="attachment-name">{attachment.fileName}</span>
                     <span className="attachment-meta">{formatFileSize(attachment.size)}</span>
                     <button
@@ -702,7 +973,7 @@ function App() {
                       className="attachment-remove"
                       disabled={isStreaming || agentSwitching}
                       onClick={() => {
-                        removeAttachment(index);
+                        removeAttachment(attachment.relativePath);
                       }}
                     >
                       移除
@@ -718,7 +989,7 @@ function App() {
                 onChange={(event) => setCommand(event.target.value)}
                 onPaste={onInputPaste}
                 placeholder={connected ? "输入问题，或直接粘贴图片 / 拖拽文件..." : "请先连接 Gateway"}
-                disabled={!connected || isStreaming || agentSwitching}
+                disabled={!connected || agentSwitching}
               />
               <button
                 type="submit"
@@ -726,6 +997,17 @@ function App() {
               >
                 {isStreaming ? "处理中..." : "发送"}
               </button>
+              {isStreaming ? (
+                <button
+                  type="button"
+                  className="composer-stop-button"
+                  onClick={() => {
+                    cancelPending("已手动停止本次请求。");
+                  }}
+                >
+                  停止
+                </button>
+              ) : null}
             </div>
           </form>
         </section>
@@ -868,6 +1150,67 @@ function App() {
                   ))}
                 </div>
               </section>
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      {showMobileRooms ? (
+        <section
+          className="mobile-room-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="切换房间"
+          onClick={() => {
+            setShowMobileRooms(false);
+          }}
+        >
+          <div
+            className="mobile-room-panel"
+            onClick={(event) => {
+              event.stopPropagation();
+            }}
+          >
+            <div className="mobile-room-head">
+              <h3>选择房间</h3>
+              <button
+                type="button"
+                className="mobile-room-close"
+                onClick={() => {
+                  setShowMobileRooms(false);
+                }}
+              >
+                关闭
+              </button>
+            </div>
+            <div className="mobile-room-list">
+              {roomList.map((room) => (
+                <button
+                  type="button"
+                  key={`mobile-${room.id}`}
+                  className={`agent-item ${effectiveActiveRoomId === room.id ? "active" : ""}`}
+                  disabled={agentSwitching}
+                  onClick={async () => {
+                    await selectRoom(room.id);
+                  }}
+                >
+                  <span className="agent-name">{room.name}</span>
+                  <span className="agent-id">agent: {room.agentId}</span>
+                  <span className="agent-model">{agentModels[resolveRoomAgentId(room)] ?? "模型: auto/default"}</span>
+                </button>
+              ))}
+              {roomList.length <= 1 ? (
+                <button
+                  type="button"
+                  className="mobile-room-manage"
+                  onClick={() => {
+                    setShowMobileRooms(false);
+                    setShowSettings(true);
+                  }}
+                >
+                  仅有 main 房间，点此去设置添加更多房间
+                </button>
+              ) : null}
             </div>
           </div>
         </section>

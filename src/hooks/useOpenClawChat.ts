@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type GatewayEventFrame,
   type HelloOkPayload,
@@ -11,6 +11,7 @@ export type ChatMessage = {
   id: string;
   role: "user" | "assistant" | "system";
   text: string;
+  createdAt: string;
   streaming?: boolean;
   images?: ChatImageItem[];
 };
@@ -40,7 +41,7 @@ export type OutboundAttachment = {
 type ChatEventPayload = {
   runId: string;
   sessionKey: string;
-  state: "delta" | "final" | "aborted" | "error";
+  state: "queued" | "running" | "delta" | "final" | "aborted" | "error";
   message?: unknown;
   errorMessage?: string;
 };
@@ -62,9 +63,26 @@ type SessionsResolveResult = {
   key?: string;
 };
 
+type ChatSendResult = {
+  runId?: string;
+  status?: string;
+};
+
+type AssistantReplyPreview = {
+  text: string;
+  createdAt: string;
+  isError?: boolean;
+  rawError?: string;
+};
+
 const DEFAULT_SCREEN_MESSAGE = "";
-const IMAGE_SEND_MAX_DIMENSION_PX = 2048;
+const IMAGE_SEND_MAX_DIMENSION_PX = 1600;
+const IMAGE_SEND_TARGET_MAX_BYTES = 420 * 1024;
+const IMAGE_SEND_HARD_MAX_BYTES = 640 * 1024;
+const IMAGE_SEND_TOTAL_MAX_BYTES = 820 * 1024;
 const INVALID_IMAGE_DATA_RE = /image data .* valid image/i;
+const USE_IMAGE_BINARY_ATTACHMENTS = false;
+const REQUEST_TIMEOUT_MS = 8000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -75,6 +93,44 @@ function createId(): string {
     return crypto.randomUUID();
   }
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function parseMaybeTimestamp(input: unknown): string | null {
+  if (typeof input === "number" && Number.isFinite(input) && input > 0) {
+    const millis = input < 1e12 ? input * 1000 : input;
+    const date = new Date(millis);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  }
+  if (typeof input === "string") {
+    const text = input.trim();
+    if (!text) {
+      return null;
+    }
+    const asNumber = Number(text);
+    if (Number.isFinite(asNumber) && asNumber > 0) {
+      const millis = asNumber < 1e12 ? asNumber * 1000 : asNumber;
+      const date = new Date(millis);
+      return Number.isNaN(date.getTime()) ? null : date.toISOString();
+    }
+    const date = new Date(text);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  }
+  return null;
+}
+
+function pickMessageCreatedAt(item: Record<string, unknown>): string {
+  const candidates = [item.createdAt, item.created_at, item.timestamp, item.time, item.ts];
+  for (const candidate of candidates) {
+    const parsed = parseMaybeTimestamp(candidate);
+    if (parsed) {
+      return parsed;
+    }
+  }
+  return nowIso();
 }
 
 function trimScreenText(input: string): string {
@@ -101,6 +157,33 @@ function parseDataUrlToBase64(dataUrl: string): { mimeType: string; content: str
 
 function toImageDataUrl(mimeType: string, content: string): string {
   return `data:${mimeType};base64,${content}`;
+}
+
+function toFileUrl(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  return normalized.startsWith("/") ? `file://${normalized}` : `file:///${normalized}`;
+}
+
+function estimateBase64ByteLength(base64: string): number {
+  const cleaned = base64.trim();
+  if (!cleaned) {
+    return 0;
+  }
+  let padding = 0;
+  if (cleaned.endsWith("==")) {
+    padding = 2;
+  } else if (cleaned.endsWith("=")) {
+    padding = 1;
+  }
+  return Math.max(0, Math.floor((cleaned.length * 3) / 4) - padding);
+}
+
+function estimateDataUrlByteLength(dataUrl: string): number {
+  const parsed = parseDataUrlToBase64(dataUrl);
+  if (!parsed) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return estimateBase64ByteLength(parsed.content);
 }
 
 function extractImageItems(content: unknown): ChatImageItem[] {
@@ -187,23 +270,58 @@ async function normalizeImageDataUrlForGateway(dataUrl: string): Promise<string>
     return dataUrl;
   }
 
+  const originalSize = estimateDataUrlByteLength(dataUrl);
+  if (Number.isFinite(originalSize) && originalSize <= IMAGE_SEND_TARGET_MAX_BYTES) {
+    return dataUrl;
+  }
+
   const source = await loadImage(dataUrl);
   const sourceWidth = source.naturalWidth || source.width || 1;
   const sourceHeight = source.naturalHeight || source.height || 1;
-  const maxDimension = Math.max(sourceWidth, sourceHeight);
-  const scale = maxDimension > IMAGE_SEND_MAX_DIMENSION_PX ? IMAGE_SEND_MAX_DIMENSION_PX / maxDimension : 1;
-  const width = Math.max(1, Math.round(sourceWidth * scale));
-  const height = Math.max(1, Math.round(sourceHeight * scale));
+  const maxDimension = Math.max(sourceWidth, sourceHeight) || 1;
+  const dimensionCandidates = [1, 0.86, 0.74, 0.62, 0.5];
+  const qualityCandidates = [0.86, 0.78, 0.7, 0.62, 0.54, 0.46];
 
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) {
-    return dataUrl;
+  let bestDataUrl = dataUrl;
+  let bestSize = originalSize;
+
+  for (const dimensionScale of dimensionCandidates) {
+    const limit = IMAGE_SEND_MAX_DIMENSION_PX * dimensionScale;
+    const scale = maxDimension > limit ? limit / maxDimension : 1;
+    const width = Math.max(1, Math.round(sourceWidth * scale));
+    const height = Math.max(1, Math.round(sourceHeight * scale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      continue;
+    }
+
+    // Flatten alpha to white for JPEG output.
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, width, height);
+    ctx.drawImage(source, 0, 0, width, height);
+
+    for (const quality of qualityCandidates) {
+      const candidate = canvas.toDataURL("image/jpeg", quality);
+      const size = estimateDataUrlByteLength(candidate);
+      if (size < bestSize) {
+        bestSize = size;
+        bestDataUrl = candidate;
+      }
+      if (size <= IMAGE_SEND_TARGET_MAX_BYTES) {
+        return candidate;
+      }
+    }
   }
-  ctx.drawImage(source, 0, 0, width, height);
-  return canvas.toDataURL("image/png");
+
+  if (bestSize <= IMAGE_SEND_HARD_MAX_BYTES) {
+    return bestDataUrl;
+  }
+
+  return bestDataUrl;
 }
 
 function extractText(value: unknown): string {
@@ -247,7 +365,12 @@ function parseChatEvent(payload: unknown): ChatEventPayload | null {
   if (
     typeof runId !== "string" ||
     typeof sessionKey !== "string" ||
-    (state !== "delta" && state !== "final" && state !== "aborted" && state !== "error")
+    (state !== "queued" &&
+      state !== "running" &&
+      state !== "delta" &&
+      state !== "final" &&
+      state !== "aborted" &&
+      state !== "error")
   ) {
     return null;
   }
@@ -259,6 +382,42 @@ function parseChatEvent(payload: unknown): ChatEventPayload | null {
     message: payload.message,
     errorMessage: typeof payload.errorMessage === "string" ? payload.errorMessage : undefined,
   };
+}
+
+function normalizeGatewayErrorMessage(message: string): string {
+  const normalized = message.trim();
+  if (!normalized) {
+    return "模型返回错误，请稍后重试。";
+  }
+  if (INVALID_IMAGE_DATA_RE.test(normalized)) {
+    return "图片内容解析失败，请重试：优先使用截图/PNG/JPEG，或换一张图后再发。";
+  }
+  return normalized;
+}
+
+function extractAssistantMessageSummary(item: Record<string, unknown>): AssistantReplyPreview | null {
+  const text = extractText(item.content ?? item.message).trim();
+  const createdAt = pickMessageCreatedAt(item);
+  if (text) {
+    return {
+      text,
+      createdAt,
+    };
+  }
+
+  const stopReason = typeof item.stopReason === "string" ? item.stopReason.trim().toLowerCase() : "";
+  const rawError = typeof item.errorMessage === "string" ? item.errorMessage : "";
+  if (rawError.trim() || stopReason === "error") {
+    const normalizedError = normalizeGatewayErrorMessage(rawError || "模型返回错误，请稍后重试。");
+    return {
+      text: `错误: ${normalizedError}`,
+      createdAt,
+      isError: true,
+      rawError: rawError || normalizedError,
+    };
+  }
+
+  return null;
 }
 
 function pickSessionKey(hello: HelloOkPayload): string {
@@ -285,10 +444,43 @@ function extractAssistantFromHistory(messages: unknown[]): string | null {
     if (role !== "assistant") {
       continue;
     }
-    const text = extractText(candidate.content ?? candidate.message);
-    if (text.trim()) {
-      return text.trim();
+    const summary = extractAssistantMessageSummary(candidate);
+    if (summary?.text.trim()) {
+      return summary.text.trim();
     }
+  }
+  return null;
+}
+
+function extractLatestAssistantReply(messages: unknown[]): AssistantReplyPreview | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const candidate = messages[index];
+    if (!isRecord(candidate)) {
+      continue;
+    }
+    const role = typeof candidate.role === "string" ? candidate.role : "";
+    if (role !== "assistant") {
+      continue;
+    }
+    const summary = extractAssistantMessageSummary(candidate);
+    if (summary) {
+      return summary;
+    }
+  }
+  return null;
+}
+
+function pickLatestAssistantText(messages: ChatMessage[]): string | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "assistant") {
+      continue;
+    }
+    const text = message.text.trim();
+    if (!text || text === "正在思考...") {
+      continue;
+    }
+    return text;
   }
   return null;
 }
@@ -296,6 +488,30 @@ function extractAssistantFromHistory(messages: unknown[]): string | null {
 function parseSessionAgentId(sessionKey: string): string | null {
   const match = /^agent:([^:]+):/.exec(sessionKey.trim());
   return match?.[1] ?? null;
+}
+
+async function requestWithTimeout<T>(
+  client: OpenClawGatewayClient,
+  method: string,
+  params?: unknown,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      reject(new Error(`${method} 请求超时`));
+    }, timeoutMs);
+
+    client
+      .request<T>(method, params)
+      .then((result) => {
+        window.clearTimeout(timer);
+        resolve(result);
+      })
+      .catch((error) => {
+        window.clearTimeout(timer);
+        reject(error);
+      });
+  });
 }
 
 function extractAgentItems(result: AgentsListResult): AgentItem[] {
@@ -337,7 +553,8 @@ function mapHistoryToChatMessages(messages: unknown[]): ChatMessage[] {
       continue;
     }
     const role = typeof item.role === "string" ? item.role : "";
-    const text = extractText(item.content ?? item.message).trim();
+    const assistantSummary = role === "assistant" ? extractAssistantMessageSummary(item) : null;
+    const text = assistantSummary?.text ?? extractText(item.content ?? item.message).trim();
     const images = extractImageItems(item.content ?? item.message);
     const normalizedText = text || (images.length > 0 ? "[图片消息]" : "");
     if (!normalizedText && images.length === 0) {
@@ -348,6 +565,7 @@ function mapHistoryToChatMessages(messages: unknown[]): ChatMessage[] {
         id: createId(),
         role,
         text: normalizedText,
+        createdAt: pickMessageCreatedAt(item),
         images: role === "user" ? images : [],
       });
     }
@@ -406,6 +624,7 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
       id: "welcome",
       role: "system",
       text: "连接 Gateway 后开始问答。",
+      createdAt: nowIso(),
     },
   ]);
 
@@ -413,10 +632,33 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
   const unsubscribeEventsRef = useRef<(() => void) | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
   const activeAssistantMessageIdRef = useRef<string | null>(null);
+  const activeAgentIdRef = useRef<string | null>(null);
   const sessionKeyRef = useRef("main");
+  const mainSessionKeyRef = useRef("main");
   const streamingTextRef = useRef("");
+  const imageErrorRecoveredSessionRef = useRef<string | null>(null);
+  const historyFallbackTimerRef = useRef<number | null>(null);
+  const historyFallbackTokenRef = useRef(0);
+  const chatMessagesRef = useRef<ChatMessage[]>(chatMessages);
+
+  useEffect(() => {
+    chatMessagesRef.current = chatMessages;
+  }, [chatMessages]);
+
+  useEffect(() => {
+    activeAgentIdRef.current = activeAgentId;
+  }, [activeAgentId]);
+
+  const stopHistoryFallback = useCallback(() => {
+    if (historyFallbackTimerRef.current !== null) {
+      window.clearTimeout(historyFallbackTimerRef.current);
+      historyFallbackTimerRef.current = null;
+    }
+    historyFallbackTokenRef.current += 1;
+  }, []);
 
   const tearDownClient = useCallback(() => {
+    stopHistoryFallback();
     if (unsubscribeEventsRef.current) {
       unsubscribeEventsRef.current();
       unsubscribeEventsRef.current = null;
@@ -425,7 +667,7 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
       clientRef.current.stop();
       clientRef.current = null;
     }
-  }, []);
+  }, [stopHistoryFallback]);
 
   const disconnect = useCallback(() => {
     activeRunIdRef.current = null;
@@ -435,14 +677,16 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
     setActiveAgentId(null);
     tearDownClient();
     setStatus("idle");
+    setSessionKey(mainSessionKeyRef.current);
+    sessionKeyRef.current = mainSessionKeyRef.current;
   }, [tearDownClient]);
 
   const loadConversationForSession = useCallback(async (client: OpenClawGatewayClient, key: string) => {
     try {
-      const history = await client.request<ChatHistoryResult>("chat.history", {
+      const history = await requestWithTimeout<ChatHistoryResult>(client, "chat.history", {
         sessionKey: key,
         limit: 20,
-      });
+      }, 6000);
       const messages = Array.isArray(history.messages) ? history.messages : [];
       const mapped = mapHistoryToChatMessages(messages);
       setChatMessages(
@@ -453,6 +697,7 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
                 id: createId(),
                 role: "system",
                 text: "当前会话暂无消息，发送第一条指令开始。",
+                createdAt: nowIso(),
               },
             ],
       );
@@ -468,6 +713,7 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
           id: createId(),
           role: "system",
           text: "读取会话历史失败，请直接发送指令。",
+          createdAt: nowIso(),
         },
       ]);
     }
@@ -477,17 +723,17 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
     async (client: OpenClawGatewayClient, currentSessionKey: string) => {
       setAgentsLoading(true);
       try {
-        const result = await client.request<AgentsListResult>("agents.list", {});
+        const result = await requestWithTimeout<AgentsListResult>(client, "agents.list", {}, 6000);
         const list = extractAgentItems(result);
         setAgents(list);
         const defaultAgentId = typeof result.defaultId === "string" ? result.defaultId : null;
 
         try {
-          const sessionsResult = await client.request<SessionsListResult>("sessions.list", {
+          const sessionsResult = await requestWithTimeout<SessionsListResult>(client, "sessions.list", {
             includeGlobal: false,
             includeUnknown: false,
             limit: 500,
-          });
+          }, 6000);
           setAgentModels(extractAgentModelMap(sessionsResult, defaultAgentId));
         } catch {
           setAgentModels({});
@@ -511,6 +757,39 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
     [],
   );
 
+  const recoverSessionFromImageError = useCallback(
+    async (client: OpenClawGatewayClient) => {
+      void client;
+      const currentSessionKey = sessionKeyRef.current;
+      if (imageErrorRecoveredSessionRef.current === currentSessionKey) {
+        return;
+      }
+      imageErrorRecoveredSessionRef.current = currentSessionKey;
+      const agentId = parseSessionAgentId(currentSessionKey) ?? activeAgentId ?? "main";
+      const nextSessionKey = `agent:${agentId}:main:webui-${Date.now()}`;
+      if (agentId === "main") {
+        mainSessionKeyRef.current = nextSessionKey;
+      }
+      setSessionKey(nextSessionKey);
+      sessionKeyRef.current = nextSessionKey;
+      activeRunIdRef.current = null;
+      activeAssistantMessageIdRef.current = null;
+      streamingTextRef.current = "";
+      setIsStreaming(false);
+      setScreenText("");
+      setChatMessages((current) => [
+        ...current,
+        {
+          id: createId(),
+          role: "system",
+          text: "检测到图片上下文异常，已自动切换到新会话。请重新发送图片。",
+          createdAt: nowIso(),
+        },
+      ]);
+    },
+    [activeAgentId],
+  );
+
   const connect = useCallback(async () => {
     tearDownClient();
     setStatus("connecting");
@@ -527,6 +806,7 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
           return;
         }
         const nextSessionKey = pickSessionKey(hello);
+        mainSessionKeyRef.current = nextSessionKey;
         setSessionKey(nextSessionKey);
         sessionKeyRef.current = nextSessionKey;
         setStatus("connected");
@@ -567,16 +847,24 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
       if (!payload) {
         return;
       }
-      if (payload.sessionKey !== sessionKeyRef.current) {
-        return;
-      }
 
       const activeRunId = activeRunIdRef.current;
-      if (activeRunId && payload.runId !== activeRunId) {
+      if (activeRunId) {
+        // One in-flight request at a time: accept first chat event as authoritative,
+        // even when gateway canonicalizes sessionKey or rewrites runId.
+        if (payload.runId !== activeRunId) {
+          activeRunIdRef.current = payload.runId;
+        }
+        if (payload.sessionKey !== sessionKeyRef.current) {
+          setSessionKey(payload.sessionKey);
+          sessionKeyRef.current = payload.sessionKey;
+        }
+      } else if (payload.sessionKey !== sessionKeyRef.current) {
         return;
       }
 
       if (payload.state === "delta") {
+        stopHistoryFallback();
         const next = extractText(payload.message);
         if (!next) {
           return;
@@ -604,14 +892,21 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
         return;
       }
 
+      if (payload.state === "queued" || payload.state === "running") {
+        setIsStreaming(true);
+        return;
+      }
+
       if (payload.state === "final") {
         const finalText = extractText(payload.message) || streamingTextRef.current;
         activeRunIdRef.current = null;
         streamingTextRef.current = "";
-        setIsStreaming(false);
         const assistantId = activeAssistantMessageIdRef.current;
-        activeAssistantMessageIdRef.current = null;
         if (finalText.trim()) {
+          stopHistoryFallback();
+          setIsStreaming(false);
+          activeAssistantMessageIdRef.current = null;
+          setLastError(null);
           setScreenText(trimScreenText(finalText));
           if (assistantId) {
             setChatMessages((current) =>
@@ -627,12 +922,18 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
             );
           }
         } else {
-          void loadConversationForSession(nextClient, sessionKeyRef.current);
+          // Keep waiting: some gateways emit `final` before history is materialized.
+          // The existing history fallback poll started in sendPrompt will continue.
+          if (!assistantId) {
+            setIsStreaming(false);
+            void loadConversationForSession(nextClient, sessionKeyRef.current);
+          }
         }
         return;
       }
 
       if (payload.state === "aborted") {
+        stopHistoryFallback();
         activeRunIdRef.current = null;
         const assistantId = activeAssistantMessageIdRef.current;
         activeAssistantMessageIdRef.current = null;
@@ -655,15 +956,14 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
         return;
       }
 
+      stopHistoryFallback();
       activeRunIdRef.current = null;
       const assistantId = activeAssistantMessageIdRef.current;
       activeAssistantMessageIdRef.current = null;
       streamingTextRef.current = "";
       setIsStreaming(false);
       const rawErrorMessage = payload.errorMessage ?? "chat error";
-      const normalizedErrorMessage = INVALID_IMAGE_DATA_RE.test(rawErrorMessage)
-        ? "图片内容解析失败，请重试：优先使用截图/PNG/JPEG，或换一张图后再发。"
-        : rawErrorMessage;
+      const normalizedErrorMessage = normalizeGatewayErrorMessage(rawErrorMessage);
       setLastError(normalizedErrorMessage);
       const errorText = `错误: ${normalizedErrorMessage}`;
       setScreenText(trimScreenText(errorText));
@@ -680,11 +980,14 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
           ),
         );
       }
+      if (INVALID_IMAGE_DATA_RE.test(rawErrorMessage)) {
+        void recoverSessionFromImageError(nextClient);
+      }
     });
 
     clientRef.current = nextClient;
     nextClient.start();
-  }, [gatewayUrl, loadConversationForSession, refreshAgentList, tearDownClient, token]);
+  }, [gatewayUrl, loadConversationForSession, recoverSessionFromImageError, refreshAgentList, stopHistoryFallback, tearDownClient, token]);
 
   const sendPrompt = useCallback(
     async (prompt: string, attachments?: OutboundAttachment[]): Promise<boolean> => {
@@ -696,6 +999,8 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
         payload: { type: "image"; mimeType: string; content: string; fileName: string };
         image: ChatImageItem;
       }> = [];
+      let imageBytesTotal = 0;
+      let droppedImageCount = 0;
       for (const attachment of safeAttachments) {
         if (!attachment.imageDataUrl) {
           continue;
@@ -712,13 +1017,21 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
         }
         const mimeType = parsed.mimeType || attachment.mimeType || "image/png";
         const normalizedDataUrl = toImageDataUrl(mimeType, parsed.content);
+        const imageBytes = estimateBase64ByteLength(parsed.content);
+        if (
+          imageBytesTotal + imageBytes > IMAGE_SEND_TOTAL_MAX_BYTES &&
+          imageAttachments.length > 0
+        ) {
+          droppedImageCount += 1;
+          continue;
+        }
+        imageBytesTotal += imageBytes;
         imageAttachments.push({
           attachment,
           payload: {
             type: "image",
             mimeType,
-            // Use full data URL for broader gateway/provider compatibility.
-            content: normalizedDataUrl,
+            content: parsed.content,
             fileName: attachment.fileName,
           },
           image: {
@@ -731,10 +1044,17 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
       }
 
       const imagePathSet = new Set(imageAttachments.map((item) => item.attachment.relativePath));
+      const formatAttachmentLocation = (attachment: OutboundAttachment) => {
+        const absolutePath = (attachment.absolutePath || "").trim();
+        if (absolutePath) {
+          return `${absolutePath} (${toFileUrl(absolutePath)})`;
+        }
+        return attachment.relativePath;
+      };
       const fileNotes = safeAttachments
         .map(
           (attachment) =>
-            `- ${imagePathSet.has(attachment.relativePath) ? "[图片]" : "[文件]"} ${attachment.fileName} (${attachment.mimeType || "application/octet-stream"}) -> ${attachment.relativePath}`,
+            `- ${imagePathSet.has(attachment.relativePath) ? "[图片]" : "[文件]"} ${attachment.fileName} (${attachment.mimeType || "application/octet-stream"}) -> ${formatAttachmentLocation(attachment)}`,
         )
         .join("\n");
       const messageWithAttachmentNotes = fileNotes
@@ -752,44 +1072,166 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
         setLastError("已有进行中的请求，请等待当前回复完成。");
         return false;
       }
+      const currentSessionKey = sessionKeyRef.current;
+      const preferredSessionKey = currentSessionKey;
+      const historySessionKeys = Array.from(
+        new Set(
+          activeAgentId === "main"
+            ? [currentSessionKey, mainSessionKeyRef.current, "main", "agent:main:main"]
+            : [currentSessionKey, mainSessionKeyRef.current],
+        ),
+      );
 
-      const runId = createId();
+      const idempotencyKey = createId();
       const assistantMessageId = createId();
-      activeRunIdRef.current = runId;
+      const createdAt = nowIso();
+      const sendStartedAtMs = Date.parse(createdAt);
+      const baselineAssistantText = pickLatestAssistantText(chatMessagesRef.current);
+      // Temporary in-flight marker before gateway returns actual runId.
+      activeRunIdRef.current = idempotencyKey;
       activeAssistantMessageIdRef.current = assistantMessageId;
       streamingTextRef.current = "";
       setIsStreaming(true);
-      setLastError(null);
+      setLastError(droppedImageCount > 0 ? `已自动跳过 ${droppedImageCount} 张超大图片。` : null);
       setLastPrompt(finalMessage);
       setScreenText("");
-      const attachmentPreview =
-        safeAttachments.length > 0
-          ? `\n\n附件:\n${safeAttachments
-              .map((item) => `${imagePathSet.has(item.relativePath) ? "[图片]" : "[文件]"} ${item.fileName}`)
-              .join("\n")}`
-          : "";
-      const userDisplayText = `${message || (imageAttachments.length > 0 ? "[图片]" : "[仅附件]")}${attachmentPreview}`.trim();
+      const userDisplayText = message;
       setChatMessages((current) => [
         ...current,
         {
           id: createId(),
           role: "user",
           text: userDisplayText,
+          createdAt,
           images: imageAttachments.map((item) => item.image),
         },
-        { id: assistantMessageId, role: "assistant", text: "正在思考...", streaming: true },
+        { id: assistantMessageId, role: "assistant", text: "正在思考...", createdAt, streaming: true },
       ]);
 
       try {
-        await client.request("chat.send", {
-          sessionKey: sessionKeyRef.current,
+        if (preferredSessionKey !== currentSessionKey) {
+          setSessionKey(preferredSessionKey);
+          sessionKeyRef.current = preferredSessionKey;
+        }
+        const sendResult = await requestWithTimeout<ChatSendResult>(client, "chat.send", {
+          sessionKey: preferredSessionKey,
           message: finalMessage,
-          attachments: imageAttachments.length > 0 ? imageAttachments.map((item) => item.payload) : undefined,
-          deliver: false,
-          idempotencyKey: runId,
+          attachments:
+            USE_IMAGE_BINARY_ATTACHMENTS && imageAttachments.length > 0
+              ? imageAttachments.map((item) => item.payload)
+              : undefined,
+          deliver: true,
+          idempotencyKey,
         });
+        if (isRecord(sendResult) && typeof sendResult.runId === "string" && sendResult.runId.trim()) {
+          activeRunIdRef.current = sendResult.runId.trim();
+        }
+        stopHistoryFallback();
+        const fallbackToken = historyFallbackTokenRef.current + 1;
+        historyFallbackTokenRef.current = fallbackToken;
+        const pollHistory = async (attempt: number) => {
+          if (historyFallbackTokenRef.current !== fallbackToken) {
+            return;
+          }
+          if (!clientRef.current || status !== "connected") {
+            return;
+          }
+          const activeAssistantId = activeAssistantMessageIdRef.current;
+          if (activeAssistantId !== assistantMessageId) {
+            return;
+          }
+          for (const historySessionKey of historySessionKeys) {
+            try {
+              const history = await requestWithTimeout<ChatHistoryResult>(client, "chat.history", {
+                sessionKey: historySessionKey,
+                limit: 20,
+              }, 5000);
+              const messages = Array.isArray(history.messages) ? history.messages : [];
+              const latestAssistant = extractLatestAssistantReply(messages);
+              if (!latestAssistant) {
+                continue;
+              }
+              const latestMs = Date.parse(latestAssistant.createdAt);
+              const isLikelyNewByTime =
+                Number.isFinite(latestMs) &&
+                Number.isFinite(sendStartedAtMs) &&
+                latestMs >= sendStartedAtMs - 1500;
+              const isLikelyNewByText =
+                baselineAssistantText === null || latestAssistant.text.trim() !== baselineAssistantText.trim();
+              if (!(isLikelyNewByTime || isLikelyNewByText)) {
+                continue;
+              }
+              stopHistoryFallback();
+              activeRunIdRef.current = null;
+              activeAssistantMessageIdRef.current = null;
+              streamingTextRef.current = "";
+              setIsStreaming(false);
+              setScreenText(trimScreenText(latestAssistant.text));
+              if (latestAssistant.isError) {
+                setLastError(latestAssistant.text.replace(/^错误:\s*/, ""));
+              } else {
+                setLastError(null);
+              }
+              if (historySessionKey !== sessionKeyRef.current) {
+                setSessionKey(historySessionKey);
+                sessionKeyRef.current = historySessionKey;
+              }
+              setChatMessages((current) =>
+                current.map((item) =>
+                  item.id === assistantMessageId
+                    ? {
+                        ...item,
+                        text: latestAssistant.text,
+                        createdAt: latestAssistant.createdAt,
+                        streaming: false,
+                      }
+                    : item,
+                ),
+              );
+              if (latestAssistant.rawError && INVALID_IMAGE_DATA_RE.test(latestAssistant.rawError)) {
+                void recoverSessionFromImageError(client);
+              }
+              return;
+            } catch {
+              // Ignore transient history fetch failures; next round may recover.
+            }
+          }
+
+          if (attempt >= 20) {
+            stopHistoryFallback();
+            activeRunIdRef.current = null;
+            activeAssistantMessageIdRef.current = null;
+            streamingTextRef.current = "";
+            setIsStreaming(false);
+            const timeoutText =
+              activeAgentId === "main"
+                ? "请求超时：main 房间未收到回复（已尝试主会话和 agent:main:main）。请重连后再试。"
+                : "请求超时：未收到回复，请重连后再试。";
+            setLastError(timeoutText);
+            setScreenText(trimScreenText(timeoutText));
+            setChatMessages((current) =>
+              current.map((item) =>
+                item.id === assistantMessageId
+                  ? {
+                      ...item,
+                      text: timeoutText,
+                      streaming: false,
+                    }
+                  : item,
+              ),
+            );
+            return;
+          }
+          historyFallbackTimerRef.current = window.setTimeout(() => {
+            void pollHistory(attempt + 1);
+          }, 1200);
+        };
+        historyFallbackTimerRef.current = window.setTimeout(() => {
+          void pollHistory(1);
+        }, 1600);
         return true;
       } catch (error) {
+        stopHistoryFallback();
         activeRunIdRef.current = null;
         activeAssistantMessageIdRef.current = null;
         streamingTextRef.current = "";
@@ -811,8 +1253,33 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
         return false;
       }
     },
-    [status],
+    [activeAgentId, recoverSessionFromImageError, status, stopHistoryFallback],
   );
+
+  const cancelPending = useCallback((reason?: string) => {
+    const finalReason = (reason ?? "已手动停止等待。").trim() || "已手动停止等待。";
+    stopHistoryFallback();
+    activeRunIdRef.current = null;
+    const assistantId = activeAssistantMessageIdRef.current;
+    activeAssistantMessageIdRef.current = null;
+    streamingTextRef.current = "";
+    setIsStreaming(false);
+    setLastError(finalReason);
+    setScreenText(trimScreenText(finalReason));
+    if (assistantId) {
+      setChatMessages((current) =>
+        current.map((item) =>
+          item.id === assistantId
+            ? {
+                ...item,
+                text: finalReason,
+                streaming: false,
+              }
+            : item,
+        ),
+      );
+    }
+  }, [stopHistoryFallback]);
 
   const switchAgent = useCallback(
     async (agentId: string): Promise<boolean> => {
@@ -826,36 +1293,83 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
         return false;
       }
       if (activeRunIdRef.current) {
-        setLastError("当前有进行中的回复，请稍后切换 Agent。");
-        return false;
+        stopHistoryFallback();
+        activeRunIdRef.current = null;
+        const assistantId = activeAssistantMessageIdRef.current;
+        activeAssistantMessageIdRef.current = null;
+        streamingTextRef.current = "";
+        setIsStreaming(false);
+        if (assistantId) {
+          setChatMessages((current) =>
+            current.map((message) =>
+              message.id === assistantId
+                ? {
+                    ...message,
+                    text: "已停止当前回复，正在切换房间...",
+                    streaming: false,
+                  }
+                : message,
+            ),
+          );
+        }
       }
-      if (nextAgentId === activeAgentId) {
+      const currentActiveAgentId = activeAgentIdRef.current;
+      const currentSessionAgentId = parseSessionAgentId(sessionKeyRef.current);
+      const isMainLikeCurrentSession =
+        sessionKeyRef.current === mainSessionKeyRef.current ||
+        sessionKeyRef.current === "main" ||
+        currentSessionAgentId === "main";
+      const alreadyInTargetSession =
+        currentSessionAgentId === nextAgentId ||
+        (nextAgentId === "main" && isMainLikeCurrentSession);
+      if (nextAgentId === currentActiveAgentId && alreadyInTargetSession) {
         return true;
       }
 
       setAgentSwitching(true);
       setLastError(null);
       try {
-        // Use explicit agent-scoped key so room -> agent routing is deterministic.
-        // Some gateway builds ignore `agentId` when resolving "main".
-        const requestedSessionKey = `agent:${nextAgentId}:main`;
-        let nextSessionKey = requestedSessionKey;
-
-        try {
-          const resolved = await client.request<SessionsResolveResult>("sessions.resolve", {
-            key: requestedSessionKey,
-            includeGlobal: true,
-          });
-          if (typeof resolved.key === "string" && resolved.key.trim()) {
-            nextSessionKey = resolved.key.trim();
+        let nextSessionKey = "";
+        if (nextAgentId === "main") {
+          const mainCandidates = Array.from(new Set([mainSessionKeyRef.current, "main", "agent:main:main"])).filter((value) =>
+            Boolean(value && value.trim()),
+          );
+          for (const candidate of mainCandidates) {
+            try {
+              const resolved = await requestWithTimeout<SessionsResolveResult>(client, "sessions.resolve", {
+                key: candidate,
+                includeGlobal: true,
+              });
+              if (typeof resolved.key === "string" && resolved.key.trim()) {
+                nextSessionKey = resolved.key.trim();
+                break;
+              }
+            } catch {
+              // Try next candidate.
+            }
           }
-        } catch {
+          if (!nextSessionKey) {
+            nextSessionKey = mainCandidates[0] ?? "main";
+          }
+        } else {
+          const requestedSessionKey = `agent:${nextAgentId}:main`;
           nextSessionKey = requestedSessionKey;
+          try {
+            const resolved = await requestWithTimeout<SessionsResolveResult>(client, "sessions.resolve", {
+              key: requestedSessionKey,
+              includeGlobal: true,
+            });
+            if (typeof resolved.key === "string" && resolved.key.trim()) {
+              nextSessionKey = resolved.key.trim();
+            }
+          } catch {
+            nextSessionKey = requestedSessionKey;
+          }
         }
-
         setActiveAgentId(nextAgentId);
         setSessionKey(nextSessionKey);
         sessionKeyRef.current = nextSessionKey;
+        imageErrorRecoveredSessionRef.current = null;
         activeRunIdRef.current = null;
         activeAssistantMessageIdRef.current = null;
         streamingTextRef.current = "";
@@ -867,6 +1381,7 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
             id: createId(),
             role: "system",
             text: `已切换到 Agent: ${nextAgentId}`,
+            createdAt: nowIso(),
           },
         ]);
         await loadConversationForSession(client, nextSessionKey);
@@ -879,7 +1394,7 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
         setAgentSwitching(false);
       }
     },
-    [activeAgentId, loadConversationForSession, status],
+    [loadConversationForSession, status, stopHistoryFallback],
   );
 
   return {
@@ -901,6 +1416,7 @@ export function useOpenClawChat(defaultUrl: string, defaultToken: string) {
     chatMessages,
     connect,
     disconnect,
+    cancelPending,
     sendPrompt,
     switchAgent,
   };
