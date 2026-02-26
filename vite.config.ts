@@ -23,12 +23,18 @@ type DevResponse = ServerResponse<IncomingMessage>;
 type NextHandler = (error?: Error) => void;
 
 const workspaceRoot = process.cwd();
+const userHomeDir = process.env.HOME ? path.resolve(process.env.HOME) : workspaceRoot;
 const uploadRootDir = path.resolve(workspaceRoot, "uploads");
 const uploadFilesDir = path.resolve(uploadRootDir, "files");
 const uploadLogPath = path.resolve(uploadRootDir, "uploads-log.jsonl");
 const roomsConfigPath = path.resolve(uploadRootDir, "rooms.json");
 const roomsBackupDir = path.resolve(uploadRootDir, "rooms-backups");
+const jsonConfigBackupDir = path.resolve(uploadRootDir, "config-backups");
+const defaultOpenClawConfigPath = path.resolve(userHomeDir, ".openclaw/openclaw.json");
 const gatewayProxyPath = "/api/gateway/ws";
+const jsonConfigApiPath = "/api/config-json";
+const jsonConfigTargetsApiPath = "/api/config-json/targets";
+const jsonConfigAllowedRoots = [workspaceRoot, path.resolve(userHomeDir, ".openclaw")];
 
 function sanitizeFileName(name: string): string {
   const stripped = name.replace(/[/\\?%*:|"<>]/g, "-").trim();
@@ -164,6 +170,224 @@ function createUploadMiddleware() {
 function matchesApiPath(requestUrl: string | undefined, suffix: string): boolean {
   const pathname = new URL(requestUrl ?? "/", "http://localhost").pathname;
   return pathname === suffix || pathname.endsWith(suffix);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function expandPathInput(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return defaultOpenClawConfigPath;
+  }
+  if (trimmed === "~") {
+    return userHomeDir;
+  }
+  if (trimmed.startsWith("~/")) {
+    return path.resolve(userHomeDir, trimmed.slice(2));
+  }
+  if (path.isAbsolute(trimmed)) {
+    return path.normalize(trimmed);
+  }
+  return path.resolve(workspaceRoot, trimmed);
+}
+
+function isPathInsideRoot(targetPath: string, rootPath: string): boolean {
+  const relative = path.relative(rootPath, targetPath);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function assertAllowedJsonConfigPath(inputPath: string): string {
+  const expanded = expandPathInput(inputPath);
+  const allowed = jsonConfigAllowedRoots.some((rootPath) => isPathInsideRoot(expanded, rootPath));
+  if (!allowed) {
+    throw new Error("该路径不在允许访问范围内。仅支持项目目录和 ~/.openclaw 目录。");
+  }
+  if (!expanded.toLowerCase().endsWith(".json")) {
+    throw new Error("仅支持编辑 .json 文件。");
+  }
+  return expanded;
+}
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function collectJsonFiles(rootDir: string, maxDepth = 2, depth = 0): Promise<string[]> {
+  if (!(await pathExists(rootDir))) {
+    return [];
+  }
+  const entries = await fs.readdir(rootDir, { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries) {
+    const fullPath = path.join(rootDir, entry.name);
+    if (entry.isFile() && entry.name.toLowerCase().endsWith(".json")) {
+      files.push(fullPath);
+      continue;
+    }
+    if (entry.isDirectory() && depth < maxDepth) {
+      const nested = await collectJsonFiles(fullPath, maxDepth, depth + 1);
+      files.push(...nested);
+    }
+  }
+  return files;
+}
+
+type ConfigTargetItem = {
+  id: string;
+  label: string;
+  path: string;
+  exists: boolean;
+};
+
+function normalizePathForUi(targetPath: string): string {
+  if (targetPath.startsWith(`${userHomeDir}${path.sep}`)) {
+    return `~/${targetPath.slice(userHomeDir.length + 1)}`;
+  }
+  return targetPath;
+}
+
+async function listConfigTargets(): Promise<ConfigTargetItem[]> {
+  const defaults = [
+    {
+      id: "openclaw-main-config",
+      label: "OpenClaw 主配置",
+      path: defaultOpenClawConfigPath,
+    },
+    {
+      id: "project-openclaw-config",
+      label: "项目内 openclaw.json",
+      path: path.resolve(workspaceRoot, "openclaw.json"),
+    },
+    {
+      id: "rooms-shared-config",
+      label: "共享房间配置",
+      path: roomsConfigPath,
+    },
+  ];
+
+  const uploadJsonFiles = await collectJsonFiles(uploadRootDir, 3);
+  const dynamicTargets = uploadJsonFiles
+    .filter((targetPath) => targetPath !== roomsConfigPath)
+    .map((targetPath) => ({
+      id: `uploads-${toPosixPath(path.relative(uploadRootDir, targetPath))}`,
+      label: `uploads/${toPosixPath(path.relative(uploadRootDir, targetPath))}`,
+      path: targetPath,
+    }));
+
+  const merged = [...defaults, ...dynamicTargets];
+  const unique = new Map<string, { id: string; label: string; path: string }>();
+  for (const item of merged) {
+    unique.set(path.normalize(item.path), item);
+  }
+
+  const results: ConfigTargetItem[] = [];
+  for (const item of unique.values()) {
+    results.push({
+      id: item.id,
+      label: item.label,
+      path: normalizePathForUi(item.path),
+      exists: await pathExists(item.path),
+    });
+  }
+  return results;
+}
+
+function parseJsonText(raw: string): { parsed: unknown | null; parseError: string | null } {
+  const text = raw.trim();
+  if (!text) {
+    return { parsed: {}, parseError: null };
+  }
+  try {
+    return { parsed: JSON.parse(raw) as unknown, parseError: null };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { parsed: null, parseError: message };
+  }
+}
+
+type ReadJsonConfigResult = {
+  path: string;
+  exists: boolean;
+  rawText: string;
+  json: unknown | null;
+  parseError: string | null;
+  updatedAt: string | null;
+  bytes: number;
+};
+
+async function readJsonConfigFile(inputPath: string): Promise<ReadJsonConfigResult> {
+  const absolutePath = assertAllowedJsonConfigPath(inputPath);
+  const exists = await pathExists(absolutePath);
+  if (!exists) {
+    const defaultText = "{\n}\n";
+    return {
+      path: normalizePathForUi(absolutePath),
+      exists: false,
+      rawText: defaultText,
+      json: {},
+      parseError: null,
+      updatedAt: null,
+      bytes: 0,
+    };
+  }
+
+  const [rawText, stat] = await Promise.all([fs.readFile(absolutePath, "utf8"), fs.stat(absolutePath)]);
+  const { parsed, parseError } = parseJsonText(rawText);
+  return {
+    path: normalizePathForUi(absolutePath),
+    exists: true,
+    rawText,
+    json: parsed,
+    parseError,
+    updatedAt: stat.mtime.toISOString(),
+    bytes: stat.size,
+  };
+}
+
+function serializeJsonPayload(value: unknown): string {
+  const serialized = JSON.stringify(value, null, 2);
+  if (typeof serialized !== "string") {
+    throw new Error("JSON 根节点必须是对象、数组、字符串、数字、布尔值或 null。");
+  }
+  return `${serialized}\n`;
+}
+
+async function writeJsonConfigFile(inputPath: string, payload: unknown): Promise<void> {
+  const absolutePath = assertAllowedJsonConfigPath(inputPath);
+  const serialized = serializeJsonPayload(payload);
+  await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+
+  if (await pathExists(absolutePath)) {
+    const previous = await fs.readFile(absolutePath, "utf8");
+    if (previous.trim()) {
+      await fs.mkdir(jsonConfigBackupDir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const backupName = `${path.basename(absolutePath, ".json")}-${stamp}.json`;
+      const backupPath = path.join(jsonConfigBackupDir, backupName);
+      await fs.writeFile(backupPath, previous, "utf8");
+
+      const backupEntries = await fs.readdir(jsonConfigBackupDir);
+      const sorted = backupEntries
+        .filter((name) => name.endsWith(".json"))
+        .sort()
+        .reverse();
+      const keepLimit = 40;
+      if (sorted.length > keepLimit) {
+        for (const staleFile of sorted.slice(keepLimit)) {
+          await fs.rm(path.join(jsonConfigBackupDir, staleFile), { force: true });
+        }
+      }
+    }
+  }
+
+  await fs.writeFile(absolutePath, serialized, "utf8");
 }
 
 function uploadsApiPlugin(): Plugin {
@@ -304,6 +528,82 @@ function roomsApiPlugin(): Plugin {
   };
 }
 
+function createJsonConfigMiddleware() {
+  return (req: DevRequest, res: DevResponse, next: NextHandler): void => {
+    const requestUrl = req.url ?? "/";
+    const parsedUrl = new URL(requestUrl, "http://localhost");
+    const pathname = parsedUrl.pathname;
+    if (!(pathname === jsonConfigApiPath || pathname.endsWith(jsonConfigApiPath) || pathname === jsonConfigTargetsApiPath || pathname.endsWith(jsonConfigTargetsApiPath))) {
+      next();
+      return;
+    }
+
+    const run = async () => {
+      if (pathname === jsonConfigTargetsApiPath || pathname.endsWith(jsonConfigTargetsApiPath)) {
+        if (req.method !== "GET") {
+          sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+          return;
+        }
+        const targets = await listConfigTargets();
+        sendJson(res, 200, {
+          ok: true,
+          targets,
+          defaultPath: normalizePathForUi(defaultOpenClawConfigPath),
+        });
+        return;
+      }
+
+      if (req.method === "GET") {
+        const targetPath = parsedUrl.searchParams.get("path") ?? "";
+        const result = await readJsonConfigFile(targetPath);
+        sendJson(res, 200, { ok: true, ...result });
+        return;
+      }
+
+      if (req.method === "PUT" || req.method === "POST") {
+        const body = await readJsonBody(req);
+        if (!isRecord(body)) {
+          sendJson(res, 400, { ok: false, error: "请求体必须是 JSON 对象。" });
+          return;
+        }
+        const rawPath = typeof body.path === "string" ? body.path.trim() : "";
+        if (!rawPath) {
+          sendJson(res, 400, { ok: false, error: "缺少 path 字段。" });
+          return;
+        }
+        if (!Object.prototype.hasOwnProperty.call(body, "json")) {
+          sendJson(res, 400, { ok: false, error: "缺少 json 字段。" });
+          return;
+        }
+        await writeJsonConfigFile(rawPath, body.json);
+        const result = await readJsonConfigFile(rawPath);
+        sendJson(res, 200, { ok: true, ...result });
+        return;
+      }
+
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+    };
+
+    void run().catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      sendJson(res, 500, { ok: false, error: `JSON 配置服务异常: ${message}` });
+    });
+  };
+}
+
+function jsonConfigApiPlugin(): Plugin {
+  const middleware = createJsonConfigMiddleware();
+  return {
+    name: "openclaw-json-config-api",
+    configureServer(server) {
+      server.middlewares.use(middleware);
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use(middleware);
+    },
+  };
+}
+
 function gatewayWsProxyPlugin(options: { target: string; pathSuffix?: string; upstreamOrigin?: string }): Plugin {
   const target = options.target.trim() || "ws://127.0.0.1:18789";
   const pathSuffix = options.pathSuffix ?? gatewayProxyPath;
@@ -412,6 +712,7 @@ export default defineConfig(({ mode }) => {
       react(),
       uploadsApiPlugin(),
       roomsApiPlugin(),
+      jsonConfigApiPlugin(),
       gatewayWsProxyPlugin({
         target: gatewayTarget,
         pathSuffix: gatewayProxyPath,

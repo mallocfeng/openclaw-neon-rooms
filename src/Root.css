@@ -1,0 +1,52 @@
+.root-shell {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.route-dock {
+  position: fixed;
+  right: 0.85rem;
+  bottom: 0.85rem;
+  z-index: 90;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  border-radius: 999px;
+  border: 1px solid rgba(122, 222, 255, 0.55);
+  background: rgba(4, 22, 38, 0.84);
+  box-shadow: 0 12px 24px rgba(2, 12, 24, 0.52);
+  backdrop-filter: blur(10px);
+  padding: 0.36rem;
+}
+
+.route-dock span {
+  color: #a9c8da;
+  font-size: 0.78rem;
+  padding: 0 0.45rem 0 0.35rem;
+  white-space: nowrap;
+}
+
+.route-dock a {
+  text-decoration: none;
+  color: #d6f6ff;
+  border: 1px solid rgba(106, 205, 242, 0.46);
+  border-radius: 999px;
+  min-width: 3.2rem;
+  text-align: center;
+  padding: 0.23rem 0.65rem;
+  font-size: 0.84rem;
+  background: rgba(8, 47, 72, 0.72);
+}
+
+.route-dock a.active {
+  border-color: rgba(150, 235, 255, 0.82);
+  background: linear-gradient(140deg, rgba(9, 108, 155, 0.88), rgba(6, 177, 215, 0.88));
+}
+
+@media (max-width: 720px) {
+  .route-dock {
+    right: 0.6rem;
+    bottom: 0.6rem;
+  }
+}
